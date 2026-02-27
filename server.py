@@ -2,15 +2,14 @@
 =============================================================================
 PacketVista — Flask Backend Server
 =============================================================================
-Directly imports packetvista.py's SimEngine, DetectionEngine, SUSPICIOUS_PORTS.
-Duration is controlled by the ?duration=N query param sent from index.html —
-no need to touch server.py when you change the duration in the frontend.
+Duration is passed as ?duration=N from index.html — server reads it
+from the query string and uses it for the capture window.
 
 Usage:
     pip install flask flask-cors
-    python server.py          # must be in same folder as packetvista.py
+    python server.py   (same folder as packetvista.py)
 
-Endpoint: GET /capture-logs?duration=5  →  downloads packetvista_logs_<ts>.txt
+Endpoint: GET /capture-logs?duration=5
 =============================================================================
 """
 
@@ -28,7 +27,6 @@ from flask_cors import CORS
 # =============================================================================
 # IMPORT DIRECTLY FROM packetvista.py (headless — no GUI launch)
 # =============================================================================
-# Stub tkinter so the module loads on servers without a display
 for _mod in ["tkinter", "tkinter.ttk", "tkinter.scrolledtext", "tkinter.messagebox"]:
     if _mod not in sys.modules:
         sys.modules[_mod] = types.ModuleType(_mod)
@@ -36,7 +34,7 @@ for _mod in ["tkinter", "tkinter.ttk", "tkinter.scrolledtext", "tkinter.messageb
 _pv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "packetvista.py")
 _spec    = importlib.util.spec_from_file_location("packetvista", _pv_path)
 pv       = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(pv)   # runs module body, NOT __main__ block
+_spec.loader.exec_module(pv)
 
 SimEngine        = pv.SimEngine
 DetectionEngine  = pv.DetectionEngine
@@ -44,37 +42,50 @@ SUSPICIOUS_PORTS = pv.SUSPICIOUS_PORTS
 
 # =============================================================================
 app = Flask(__name__)
-CORS(app)
 
-DEFAULT_DURATION = 5    # fallback if no ?duration param is sent
-MAX_DURATION     = 60   # safety cap — prevent runaway captures
+# Explicit CORS — allow all origins, expose headers the browser needs
+CORS(app, resources={r"/*": {"origins": "*"}},
+     expose_headers=["Content-Disposition"],
+     allow_headers=["Content-Type"],
+     methods=["GET", "OPTIONS"])
+
+DEFAULT_DURATION = 5
+MAX_DURATION     = 60
+
+
+# Explicit OPTIONS handler so preflight never blocks the duration param
+@app.route("/capture-logs", methods=["OPTIONS"])
+def capture_logs_preflight():
+    resp = Response("")
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp, 204
 
 
 # =============================================================================
 # /capture-logs
 # =============================================================================
 
-@app.route("/capture-logs")
+@app.route("/capture-logs", methods=["GET"])
 def capture_logs():
-    """
-    Reads ?duration=N from the request (sent by index.html automatically).
-    Falls back to DEFAULT_DURATION if not provided.
-    Capped at MAX_DURATION for safety.
-    """
+    # ── Read ?duration=N — with full debug print so you can see it in logs ───
+    raw = request.args.get("duration", "")
+    print(f"[PacketVista] Received request | raw duration param: '{raw}'", flush=True)
 
-    # ── Read duration from query param ────────────────────────────────────────
     try:
-        duration = int(request.args.get("duration", DEFAULT_DURATION))
-        duration = max(1, min(duration, MAX_DURATION))   # clamp 1..MAX
+        duration = int(raw)
+        duration = max(1, min(duration, MAX_DURATION))
     except (ValueError, TypeError):
         duration = DEFAULT_DURATION
 
+    print(f"[PacketVista] Using duration: {duration}s", flush=True)
+
     pkt_q       = queue.Queue(maxsize=10000)
-    log_lines   = []    # tuples: (kind, timestamp_float, text)
+    log_lines   = []
     alert_lines = []
     lock        = threading.Lock()
 
-    # Alert callback — mirrors _handle_alert() in the GUI
     def on_alert(atype, src, detail):
         now  = time.time()
         line = f"[{datetime.now().strftime('%H:%M:%S')}] [{atype}]  {detail}"
@@ -86,7 +97,6 @@ def capture_logs():
     sim      = SimEngine(pkt_q)
     stop_evt = threading.Event()
 
-    # Consumer thread — mirrors _handle_pkt() in the GUI
     def consumer():
         while not stop_evt.is_set() or not pkt_q.empty():
             try:
@@ -104,11 +114,9 @@ def capture_logs():
             blen   = item.get("len", 0)
             ts_str = datetime.now().strftime("%H:%M:%S")
 
-            # Same alert logic as GUI _handle_pkt()
             alert_text = ("SUSPICIOUS: " + SUSPICIOUS_PORTS[dp]) if dp in SUSPICIOUS_PORTS else ""
-
-            sport_str = str(sp) if sp else ""
-            dport_str = str(dp) if dp else ""
+            sport_str  = str(sp) if sp else ""
+            dport_str  = str(dp) if dp else ""
 
             line = (
                 f"{ts_str:<10}  "
@@ -128,15 +136,13 @@ def capture_logs():
     t = threading.Thread(target=consumer, daemon=True)
     t.start()
 
-    # ── Run simulation for `duration` seconds (from query param) ─────────────
     sim.start()
     time.sleep(duration)
     sim.stop()
-    time.sleep(0.5)      # drain tail
+    time.sleep(0.5)
     stop_evt.set()
     t.join(timeout=3)
 
-    # Sort chronologically
     with lock:
         sorted_lines = sorted(log_lines, key=lambda x: x[1])
 
@@ -144,8 +150,8 @@ def capture_logs():
     alrt_rows = [l for k, _, l in sorted_lines if k == "alert"]
     scan_c, syn_c, susp_c, rep_c = engine.counters()
 
-    S  = "=" * 80
-    s  = "-" * 80
+    S = "=" * 80
+    s = "-" * 80
 
     table_hdr = (
         f"{'Time':<10}  {'Source IP':<18}  {'Dest IP':<18}  "
@@ -191,26 +197,33 @@ def capture_logs():
     ])
 
     filename = f"packetvista_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    return Response(
+
+    resp = Response(
         report,
         mimetype="text/plain",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Disposition":        f'attachment; filename="{filename}"',
+            "Content-Type":               "text/plain; charset=utf-8",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "Content-Disposition",
         }
     )
+    return resp
 
 
 @app.route("/")
 def index():
-    return "<h2>PacketVista backend running. GET /capture-logs?duration=5 to capture.</h2>"
+    return (
+        "<h2>PacketVista backend running.</h2>"
+        "<p>Endpoint: <code>GET /capture-logs?duration=5</code></p>"
+    )
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
     print(f"  PacketVista Backend  →  http://localhost:{port}")
-    print(f"  Capture endpoint     →  GET /capture-logs?duration=5")
+    print(f"  Capture endpoint     →  /capture-logs?duration=5")
     print(f"  Default duration     :  {DEFAULT_DURATION}s  (max {MAX_DURATION}s)")
     print("=" * 60)
     app.run(host="0.0.0.0", port=port, debug=False)
