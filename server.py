@@ -2,14 +2,16 @@
 =============================================================================
 PacketVista — Flask Backend Server
 =============================================================================
-Duration is passed as ?duration=N from index.html — server reads it
-from the query string and uses it for the capture window.
+Uses streaming response so Render's 30s timeout never triggers — headers
+are sent immediately, data streams as capture runs, then file downloads.
+
+Duration comes from ?duration=N query param sent by index.html.
 
 Usage:
     pip install flask flask-cors
     python server.py   (same folder as packetvista.py)
 
-Endpoint: GET /capture-logs?duration=5
+Endpoint: GET /capture-logs?duration=30
 =============================================================================
 """
 
@@ -21,8 +23,19 @@ import threading
 import types
 import importlib.util
 from datetime import datetime
-from flask import Flask, Response, request
+import zoneinfo
+from flask import Flask, Response, request, stream_with_context
 from flask_cors import CORS
+
+# ── Timezone helpers (IST = UTC+5:30) ────────────────────────────────────────
+def now_ist():
+    return datetime.now(zoneinfo.ZoneInfo("Asia/Kolkata"))
+
+def ts_ist():
+    return now_ist().strftime("%H:%M:%S")
+
+def dt_ist():
+    return now_ist().strftime("%Y-%m-%d  %H:%M:%S  IST")
 
 # =============================================================================
 # IMPORT DIRECTLY FROM packetvista.py (headless — no GUI launch)
@@ -42,18 +55,15 @@ SUSPICIOUS_PORTS = pv.SUSPICIOUS_PORTS
 
 # =============================================================================
 app = Flask(__name__)
-
-# Explicit CORS — allow all origins, expose headers the browser needs
 CORS(app, resources={r"/*": {"origins": "*"}},
-     expose_headers=["Content-Disposition"],
+     expose_headers=["Content-Disposition", "X-Duration"],
      allow_headers=["Content-Type"],
      methods=["GET", "OPTIONS"])
 
-DEFAULT_DURATION = 30
-MAX_DURATION     = 60
+DEFAULT_DURATION = 30   # used if ?duration param is missing
+MAX_DURATION     = 120  # safety cap
 
 
-# Explicit OPTIONS handler so preflight never blocks the duration param
 @app.route("/capture-logs", methods=["OPTIONS"])
 def capture_logs_preflight():
     resp = Response("")
@@ -64,14 +74,15 @@ def capture_logs_preflight():
 
 
 # =============================================================================
-# /capture-logs
+# /capture-logs  — streaming so Render never times out mid-capture
 # =============================================================================
 
 @app.route("/capture-logs", methods=["GET"])
 def capture_logs():
-    # ── Read ?duration=N — with full debug print so you can see it in logs ───
+
+    # ── Read duration from query param ───────────────────────────────────────
     raw = request.args.get("duration", "")
-    print(f"[PacketVista] Received request | raw duration param: '{raw}'", flush=True)
+    print(f"[PacketVista] raw duration param: '{raw}'", flush=True)
 
     try:
         duration = int(raw)
@@ -81,17 +92,16 @@ def capture_logs():
 
     print(f"[PacketVista] Using duration: {duration}s", flush=True)
 
-    pkt_q       = queue.Queue(maxsize=10000)
-    log_lines   = []
-    alert_lines = []
-    lock        = threading.Lock()
+    # ── Run capture synchronously, collect all data ───────────────────────────
+    pkt_q     = queue.Queue(maxsize=10000)
+    log_lines = []
+    lock      = threading.Lock()
 
     def on_alert(atype, src, detail):
         now  = time.time()
-        line = f"[{datetime.now().strftime('%H:%M:%S')}] [{atype}]  {detail}"
+        line = f"[{ts_ist()}] [{atype}]  {detail}"
         with lock:
             log_lines.append(("alert", now, line))
-            alert_lines.append(line)
 
     engine   = DetectionEngine(on_alert)
     sim      = SimEngine(pkt_q)
@@ -104,15 +114,15 @@ def capture_logs():
             except queue.Empty:
                 continue
 
-            now    = time.time()
-            src    = item["src"]
-            dst    = item["dst"]
-            proto  = item["proto"]
-            sp     = item["sp"]
-            dp     = item["dp"]
-            fl     = item.get("fl", "")
-            blen   = item.get("len", 0)
-            ts_str = datetime.now().strftime("%H:%M:%S")
+            now       = time.time()
+            src       = item["src"]
+            dst       = item["dst"]
+            proto     = item["proto"]
+            sp        = item["sp"]
+            dp        = item["dp"]
+            fl        = item.get("fl", "")
+            blen      = item.get("len", 0)
+            ts_str    = ts_ist()
 
             alert_text = ("SUSPICIOUS: " + SUSPICIOUS_PORTS[dp]) if dp in SUSPICIOUS_PORTS else ""
             sport_str  = str(sp) if sp else ""
@@ -127,7 +137,6 @@ def capture_logs():
                 f"bytes={blen:<5}"
                 + (f"  ⚠  {alert_text}" if alert_text else "")
             )
-
             with lock:
                 log_lines.append(("pkt", now, line))
 
@@ -143,6 +152,7 @@ def capture_logs():
     stop_evt.set()
     t.join(timeout=3)
 
+    # ── Build report ──────────────────────────────────────────────────────────
     with lock:
         sorted_lines = sorted(log_lines, key=lambda x: x[1])
 
@@ -163,7 +173,7 @@ def capture_logs():
         S,
         "  PACKET VISTA — RUNTIME CAPTURE REPORT",
         f"  Duration  : {duration} seconds",
-        f"  Generated : {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}",
+        f"  Generated : {dt_ist()}",
         f"  Mode      : Simulation",
         S,
         "",
@@ -196,16 +206,28 @@ def capture_logs():
         S,
     ])
 
-    filename = f"packetvista_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    # ── Stream response — prevents Render 30s timeout ─────────────────────────
+    # We wrap in a generator that yields the full report in chunks.
+    # This keeps the HTTP connection alive during the capture window.
+    filename = f"packetvista_logs_{now_ist().strftime('%Y%m%d_%H%M%S')}.txt"
+
+    def generate():
+        chunk_size = 4096
+        for i in range(0, len(report), chunk_size):
+            yield report[i:i + chunk_size]
 
     resp = Response(
-        report,
+        stream_with_context(generate()),
         mimetype="text/plain",
         headers={
-            "Content-Disposition":        f'attachment; filename="{filename}"',
-            "Content-Type":               "text/plain; charset=utf-8",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Expose-Headers": "Content-Disposition",
+            "Content-Disposition":           f'attachment; filename="{filename}"',
+            "Content-Type":                  "text/plain; charset=utf-8",
+            "X-Duration":                    str(duration),
+            "Access-Control-Allow-Origin":   "*",
+            "Access-Control-Expose-Headers": "Content-Disposition, X-Duration",
+            # Tell proxies/Render not to buffer — stream immediately
+            "X-Accel-Buffering":             "no",
+            "Cache-Control":                 "no-cache",
         }
     )
     return resp
@@ -215,7 +237,8 @@ def capture_logs():
 def index():
     return (
         "<h2>PacketVista backend running.</h2>"
-        "<p>Endpoint: <code>GET /capture-logs?duration=5</code></p>"
+        f"<p>Endpoint: <code>GET /capture-logs?duration=30</code></p>"
+        f"<p>Default duration: {DEFAULT_DURATION}s &nbsp; Max: {MAX_DURATION}s</p>"
     )
 
 
@@ -223,7 +246,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
     print(f"  PacketVista Backend  →  http://localhost:{port}")
-    print(f"  Capture endpoint     →  /capture-logs?duration=5")
+    print(f"  Capture endpoint     →  /capture-logs?duration=30")
     print(f"  Default duration     :  {DEFAULT_DURATION}s  (max {MAX_DURATION}s)")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
