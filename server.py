@@ -2,340 +2,184 @@
 =============================================================================
 PacketVista — Flask Backend Server
 =============================================================================
-Runs the PacketVista simulation engine for 5 seconds, captures all
-packet/alert output, and returns it as a downloadable .txt file.
+Directly imports packetvista.py's own SimEngine, DetectionEngine, and
+SUSPICIOUS_PORTS — produces output in the EXACT same format as the GUI:
+
+  PACKET TABLE  →  Time | Src | Dst | Proto | SrcPort | DstPort | Flags | Bytes | Alert
+  ALERT LOG     →  [HH:MM:SS] [ALERT_TYPE]  detail
 
 Usage:
-    pip install flask
-    python server.py
+    pip install flask flask-cors
+    python server.py          # must be in the same folder as packetvista.py
 
-The server listens on http://localhost:5000
 Endpoint: GET /capture-logs  →  downloads packetvista_logs_<timestamp>.txt
 =============================================================================
 """
 
-from flask import Flask, Response
-from flask_cors import CORS
+import os
+import sys
 import queue
 import time
-import random
 import threading
-import ipaddress
-from collections import defaultdict, deque
+import types
+import importlib.util
 from datetime import datetime
+from flask import Flask, Response
+from flask_cors import CORS
 
+# =============================================================================
+# IMPORT DIRECTLY FROM packetvista.py (headless — no GUI launch)
+# =============================================================================
+# Stub tkinter so the module loads fine on servers without a display
+for _mod in ["tkinter", "tkinter.ttk", "tkinter.scrolledtext", "tkinter.messagebox"]:
+    if _mod not in sys.modules:
+        sys.modules[_mod] = types.ModuleType(_mod)
+
+_pv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "packetvista.py")
+_spec    = importlib.util.spec_from_file_location("packetvista", _pv_path)
+pv       = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(pv)   # runs module body but NOT __main__ block
+
+SimEngine        = pv.SimEngine
+DetectionEngine  = pv.DetectionEngine
+SUSPICIOUS_PORTS = pv.SUSPICIOUS_PORTS
+
+# =============================================================================
 app = Flask(__name__)
-CORS(app)  # Allow requests from the HTML page (file:// or any host)
+CORS(app)
+
+CAPTURE_DURATION = 5   # seconds
 
 
 # =============================================================================
-# CONSTANTS (mirrored from packetvista.py)
-# =============================================================================
-
-SUSPICIOUS_PORTS = {
-    20: "FTP-Data", 21: "FTP", 22: "SSH", 23: "Telnet",
-    25: "SMTP", 135: "MS-RPC", 139: "NetBIOS", 445: "SMB",
-    1433: "MSSQL", 3306: "MySQL", 3389: "RDP",
-    4444: "Metasploit", 5900: "VNC", 6667: "IRC",
-}
-
-PS_PORTS  = 12
-PS_WINDOW = 10
-SF_COUNT  = 40
-SF_WINDOW = 5
-RC_COUNT  = 15
-RC_WINDOW = 5
-
-CAPTURE_DURATION = 5  # seconds
-
-
-# =============================================================================
-# INLINE SIMULATION ENGINE (headless — no tkinter / GUI)
-# =============================================================================
-
-class DetectionEngine:
-    def __init__(self, alert_cb):
-        self._cb   = alert_cb
-        self._lock = threading.Lock()
-        self._scan_dq   = defaultdict(deque)
-        self._syn_dq    = defaultdict(deque)
-        self._rep_dq    = defaultdict(deque)
-        self._alerted_scan = set()
-        self._alerted_syn  = set()
-        self._alerted_rep  = set()
-        self.c_scan = self.c_syn = self.c_susp = self.c_rep = 0
-
-    def process(self, src, dst, proto, sport, dport, flags):
-        now = time.time()
-        with self._lock:
-            self._susp(src, dst, dport)
-            if proto == "TCP":
-                self._syn_flood(src, flags, now)
-                self._port_scan(src, dport, now)
-                self._repeat(src, dport, now)
-
-    def counters(self):
-        with self._lock:
-            return (self.c_scan, self.c_syn, self.c_susp, self.c_rep)
-
-    def _susp(self, src, dst, port):
-        if port in SUSPICIOUS_PORTS:
-            self.c_susp += 1
-            self._cb("SUSPICIOUS PORT", src,
-                     f"Port {port} ({SUSPICIOUS_PORTS[port]})  {src} -> {dst}")
-
-    def _syn_flood(self, src, flags, now):
-        if "S" not in str(flags):
-            return
-        dq = self._syn_dq[src]
-        dq.append(now)
-        cut = now - SF_WINDOW
-        while dq and dq[0] < cut:
-            dq.popleft()
-        if len(dq) >= SF_COUNT:
-            if src not in self._alerted_syn:
-                self._alerted_syn.add(src)
-                self.c_syn += 1
-                self._cb("SYN FLOOD", src,
-                         f"{len(dq)} SYN pkts from {src} in {SF_WINDOW}s")
-        else:
-            self._alerted_syn.discard(src)
-
-    def _port_scan(self, src, port, now):
-        dq = self._scan_dq[src]
-        dq.append((now, port))
-        cut = now - PS_WINDOW
-        while dq and dq[0][0] < cut:
-            dq.popleft()
-        distinct = len({p for _, p in dq})
-        if distinct >= PS_PORTS:
-            if src not in self._alerted_scan:
-                self._alerted_scan.add(src)
-                self.c_scan += 1
-                self._cb("PORT SCAN", src,
-                         f"{src} hit {distinct} ports in {PS_WINDOW}s")
-        else:
-            self._alerted_scan.discard(src)
-
-    def _repeat(self, src, port, now):
-        key = (src, port)
-        dq  = self._rep_dq[key]
-        dq.append(now)
-        cut = now - RC_WINDOW
-        while dq and dq[0] < cut:
-            dq.popleft()
-        if len(dq) >= RC_COUNT:
-            if key not in self._alerted_rep:
-                self._alerted_rep.add(key)
-                self.c_rep += 1
-                self._cb("REPEAT CONN", src,
-                         f"{src} -> port {port}  x{len(dq)} in {RC_WINDOW}s")
-        else:
-            self._alerted_rep.discard(key)
-
-
-class SimEngine:
-    _SRCS = [
-        "203.0.113.10", "198.51.100.5", "185.220.101.34",
-        "91.108.4.200",  "104.21.30.1",  "45.33.32.156",
-        "192.0.2.77",    "8.8.8.8",      "1.1.1.1",
-    ]
-    _DSTS = ["10.0.0.1", "10.0.0.2", "192.168.1.100"]
-
-    def __init__(self, pkt_q):
-        self._q    = pkt_q
-        self._stop = threading.Event()
-        self._tick = 0
-
-    def start(self):
-        self._stop.clear()
-        threading.Thread(target=self._loop, daemon=True).start()
-
-    def stop(self):
-        self._stop.set()
-
-    def _loop(self):
-        while not self._stop.is_set():
-            self._tick += 1
-            for _ in range(random.randint(3, 8)):
-                self._normal()
-            if self._tick % 5  == 0: self._inject_susp_port()
-            if self._tick % 7  == 0: self._inject_port_scan()
-            if self._tick % 10 == 0: self._inject_syn_flood()
-            if self._tick % 8  == 0: self._inject_repeat()
-            time.sleep(0.3)
-
-    def _emit(self, src, dst, proto, sp, dp, fl=""):
-        try:
-            self._q.put_nowait({
-                "src": src, "dst": dst,
-                "proto": proto, "sp": sp, "dp": dp,
-                "fl": fl, "len": random.randint(40, 1500),
-            })
-        except queue.Full:
-            pass
-
-    def _normal(self):
-        src   = random.choice(self._SRCS)
-        dst   = random.choice(self._DSTS)
-        proto = random.choice(["TCP", "TCP", "UDP", "ICMP"])
-        if proto == "TCP":
-            self._emit(src, dst, "TCP",
-                       random.randint(1024, 65535),
-                       random.choice([80, 443, 8080, 53, 8443]), "PA")
-        elif proto == "UDP":
-            self._emit(src, dst, "UDP",
-                       random.randint(1024, 65535),
-                       random.choice([53, 123, 161, 5353]))
-        else:
-            self._emit(src, dst, "ICMP", 0, 0)
-
-    def _inject_susp_port(self):
-        src  = random.choice(self._SRCS)
-        dst  = random.choice(self._DSTS)
-        port = random.choice(list(SUSPICIOUS_PORTS.keys()))
-        self._emit(src, dst, "TCP", random.randint(1024, 65535), port, "S")
-
-    def _inject_port_scan(self):
-        src   = random.choice(self._SRCS)
-        dst   = self._DSTS[0]
-        ports = random.sample(range(1, 1025), PS_PORTS + 3)
-        for p in ports:
-            self._emit(src, dst, "TCP", random.randint(1024, 65535), p, "S")
-
-    def _inject_syn_flood(self):
-        src = random.choice(self._SRCS)
-        dst = self._DSTS[1]
-        for _ in range(SF_COUNT + 15):
-            self._emit(src, dst, "TCP", random.randint(1024, 65535), 80, "S")
-
-    def _inject_repeat(self):
-        src = random.choice(self._SRCS)
-        dst = self._DSTS[2]
-        for _ in range(RC_COUNT + 5):
-            self._emit(src, dst, "TCP", random.randint(1024, 65535), 443, "S")
-
-
-# =============================================================================
-# CAPTURE ENDPOINT
+# /capture-logs
 # =============================================================================
 
 @app.route("/capture-logs")
 def capture_logs():
-    """
-    Runs the PacketVista simulation for CAPTURE_DURATION seconds,
-    collects all packet and alert lines, then returns a .txt download.
-    """
-    pkt_q    = queue.Queue(maxsize=5000)
-    log_q    = queue.Queue()       # collects formatted log lines
-    alerts   = []                  # alert lines (prefixed *** ALERT ***)
+    pkt_q      = queue.Queue(maxsize=10000)
+    log_lines  = []    # tuples: (kind, timestamp_float, text)
+    alert_lines = []
+    lock        = threading.Lock()
 
-    # ── Alert callback (called from DetectionEngine) ──────────────────────────
-    def on_alert(alert_type, src, detail):
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        line = f"[{ts}] *** ALERT *** [{alert_type}]  {detail}"
-        log_q.put(line)
-        alerts.append(line)
+    # Alert callback — mirrors _handle_alert() in the GUI
+    def on_alert(atype, src, detail):
+        now  = time.time()
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] [{atype}]  {detail}"
+        with lock:
+            log_lines.append(("alert", now, line))
+            alert_lines.append(line)
 
     engine = DetectionEngine(on_alert)
     sim    = SimEngine(pkt_q)
+    stop_evt = threading.Event()
 
-    # ── Consumer thread: drain pkt_q → format → push to log_q ───────────────
+    # Consumer thread — mirrors _handle_pkt() in the GUI
     def consumer():
-        while True:
+        while not stop_evt.is_set() or not pkt_q.empty():
             try:
-                pkt = pkt_q.get(timeout=0.1)
+                item = pkt_q.get(timeout=0.05)
             except queue.Empty:
-                if stop_evt.is_set():
-                    break
                 continue
 
-            ts    = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            proto = pkt["proto"]
-            src   = pkt["src"]
-            dst   = pkt["dst"]
-            sp    = pkt["sp"]
-            dp    = pkt["dp"]
-            fl    = pkt["fl"]
-            length = pkt["len"]
+            now   = time.time()
+            src   = item["src"]
+            dst   = item["dst"]
+            proto = item["proto"]
+            sp    = item["sp"]
+            dp    = item["dp"]
+            fl    = item.get("fl", "")
+            blen  = item.get("len", 0)
+            ts_str = datetime.now().strftime("%H:%M:%S")
 
-            if proto == "TCP":
-                line = (f"[{ts}] TCP  {src}:{sp:>5} -> {dst}:{dp:<5}  "
-                        f"flags={fl:<4}  len={length}")
-            elif proto == "UDP":
-                line = (f"[{ts}] UDP  {src}:{sp:>5} -> {dst}:{dp:<5}  "
-                        f"len={length}")
-            else:
-                line = (f"[{ts}] {proto:<5}{src}           -> {dst}  "
-                        f"len={length}")
+            # Same alert logic as GUI _handle_pkt()
+            alert_text = ("SUSPICIOUS: " + SUSPICIOUS_PORTS[dp]) if dp in SUSPICIOUS_PORTS else ""
 
-            log_q.put(line)
+            sport_str = str(sp) if sp else ""
+            dport_str = str(dp) if dp else ""
+
+            line = (
+                f"{ts_str:<10}  "
+                f"{src:<18}  {dst:<18}  "
+                f"{proto:<5}  "
+                f"{sport_str:>6} -> {dport_str:<6}  "
+                f"flags={fl:<4}  "
+                f"bytes={blen:<5}"
+                + (f"  ⚠  {alert_text}" if alert_text else "")
+            )
+
+            with lock:
+                log_lines.append(("pkt", now, line))
+
             engine.process(src, dst, proto, sp, dp, fl)
 
-    stop_evt = threading.Event()
-    t_consumer = threading.Thread(target=consumer, daemon=True)
-    t_consumer.start()
+    t = threading.Thread(target=consumer, daemon=True)
+    t.start()
 
-    # ── Run simulation for CAPTURE_DURATION seconds ───────────────────────────
     sim.start()
     time.sleep(CAPTURE_DURATION)
     sim.stop()
-
-    # Give consumer a moment to drain remaining items
-    time.sleep(0.4)
+    time.sleep(0.5)      # drain tail
     stop_evt.set()
-    t_consumer.join(timeout=2)
+    t.join(timeout=3)
 
-    # ── Drain log_q into ordered list ────────────────────────────────────────
-    lines = []
-    while not log_q.empty():
-        lines.append(log_q.get_nowait())
+    # Sort chronologically
+    with lock:
+        sorted_lines = sorted(log_lines, key=lambda x: x[1])
 
-    # Sort by timestamp prefix so alerts intersperse correctly
-    lines.sort()
-
-    # ── Build report ─────────────────────────────────────────────────────────
+    pkt_rows   = [l for k, _, l in sorted_lines if k == "pkt"]
+    alrt_rows  = [l for k, _, l in sorted_lines if k == "alert"]
     scan_c, syn_c, susp_c, rep_c = engine.counters()
-    total_pkts = sum(1 for l in lines if "ALERT" not in l)
-    total_alerts = len(alerts)
 
-    header = "\n".join([
-        "=" * 72,
-        "  PACKET VISTA — CAPTURE REPORT",
-        f"  Capture duration : {CAPTURE_DURATION} seconds",
-        f"  Generated at     : {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}",
-        f"  Mode             : Simulation",
-        "=" * 72,
+    S  = "=" * 80
+    s  = "-" * 80
+
+    table_hdr = (
+        f"{'Time':<10}  {'Source IP':<18}  {'Dest IP':<18}  "
+        f"{'Proto':<5}  {'SrcPort':>6}    {'DstPort':<6}  "
+        f"{'Flags':<9}  {'Bytes':<8}  Alert"
+    )
+
+    report = "\n".join([
+        S,
+        "  PACKET VISTA — RUNTIME CAPTURE REPORT",
+        f"  Duration  : {CAPTURE_DURATION} seconds",
+        f"  Generated : {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}",
+        f"  Mode      : Simulation",
+        S,
         "",
-        "  SUMMARY",
-        "  ─────────────────────────────────────────",
-        f"  Total packets captured : {total_pkts}",
-        f"  Total alerts fired     : {total_alerts}",
-        f"    Port scan detections : {scan_c}",
-        f"    SYN flood detections : {syn_c}",
-        f"    Suspicious ports     : {susp_c}",
-        f"    Repeat connections   : {rep_c}",
+        "  ATTACK COUNTERS",
+        s,
+        f"  Port Scans Detected  : {scan_c}",
+        f"  SYN Floods Detected  : {syn_c}",
+        f"  Suspicious Port Hits : {susp_c}",
+        f"  Repeat Conn Alerts   : {rep_c}",
         "",
-        "  TRAFFIC LOG  (chronological)",
-        "  ─────────────────────────────────────────",
+        f"  Total Packets  : {len(pkt_rows)}",
+        f"  Total Alerts   : {len(alrt_rows)}",
         "",
+        S,
+        "  ALERT LOG",
+        s,
+        "",
+        ("\n".join(alrt_rows) if alrt_rows else "  (no alerts)"),
+        "",
+        S,
+        "  LIVE PACKET FEED",
+        s,
+        "",
+        table_hdr,
+        s,
+        ("\n".join(pkt_rows) if pkt_rows else "  (no packets)"),
+        "",
+        S,
+        "  END OF REPORT — Packet Vista v1.0",
+        S,
     ])
 
-    footer = "\n".join([
-        "",
-        "=" * 72,
-        "  END OF REPORT",
-        "=" * 72,
-    ])
-
-    report_text = header + "\n".join(lines) + footer
-
-    # ── Stream as downloadable file ───────────────────────────────────────────
-    ts_str   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"packetvista_logs_{ts_str}.txt"
-
+    filename = f"packetvista_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     return Response(
-        report_text,
+        report,
         mimetype="text/plain",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
@@ -346,17 +190,13 @@ def capture_logs():
 
 @app.route("/")
 def index():
-    return "<h2>PacketVista backend is running. Use <code>/capture-logs</code> to capture.</h2>"
+    return "<h2>PacketVista backend running. GET /capture-logs to capture.</h2>"
 
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("  PacketVista Backend  →  http://localhost:5000")
-    print("  Capture endpoint     →  GET /capture-logs")
-    print("=" * 60)
-    app.run(host="0.0.0.0", port=5000, debug=False)
-
-import os
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    print("=" * 60)
+    print(f"  PacketVista Backend  →  http://localhost:{port}")
+    print(f"  Capture endpoint     →  GET /capture-logs")
+    print("=" * 60)
     app.run(host="0.0.0.0", port=port, debug=False)
