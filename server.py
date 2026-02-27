@@ -49,7 +49,7 @@ CORS(app, resources={r"/*": {"origins": "*"}},
      allow_headers=["Content-Type"],
      methods=["GET", "OPTIONS"])
 
-DEFAULT_DURATION = 5
+DEFAULT_DURATION = 30
 MAX_DURATION     = 60
 
 
