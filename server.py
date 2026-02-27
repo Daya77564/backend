@@ -40,9 +40,66 @@ def dt_ist():
 # =============================================================================
 # IMPORT DIRECTLY FROM packetvista.py (headless — no GUI launch)
 # =============================================================================
-for _mod in ["tkinter", "tkinter.ttk", "tkinter.scrolledtext", "tkinter.messagebox"]:
-    if _mod not in sys.modules:
-        sys.modules[_mod] = types.ModuleType(_mod)
+class _TkStub:
+    """Catch-all stub — returns itself for any attribute access or call."""
+    def __getattr__(self, name):
+        return self
+    def __call__(self, *args, **kwargs):
+        return self
+    def __str__(self):
+        return ""
+    def __iter__(self):
+        return iter([])
+
+_tk_stub = _TkStub()
+
+# Build proper stub modules for tkinter and its submodules BEFORE importing packetvista
+import types as _types
+
+def _make_tk_module(name):
+    m = _types.ModuleType(name)
+    # Tk widget classes and constants
+    for _cls in ["Tk","Frame","LabelFrame","Label","Button","Entry","Text",
+                 "Canvas","Scrollbar","Menu","Menubutton","OptionMenu",
+                 "Spinbox","Listbox","Checkbutton","Radiobutton","Scale",
+                 "PanedWindow","Toplevel","PhotoImage","BitmapImage",
+                 # ttk extras
+                 "Notebook","Treeview","Combobox","Separator","Progressbar","Style",
+                 # scrolledtext
+                 "ScrolledText"]:
+        setattr(m, _cls, _TkStub)
+    for _fn in ["showinfo","showwarning","showerror","askquestion",
+                "askyesno","askokcancel","askyesnocancel"]:
+        setattr(m, _fn, lambda *a, **k: None)
+    for _var in ["StringVar","IntVar","DoubleVar","BooleanVar"]:
+        setattr(m, _var, _TkStub)
+    for _const, _val in [
+        ("END","end"),("INSERT","insert"),("SEL","sel"),("SEL_FIRST","sel.first"),
+        ("SEL_LAST","sel.last"),("BOTH","both"),("LEFT","left"),("RIGHT","right"),
+        ("TOP","top"),("BOTTOM","bottom"),("X","x"),("Y","y"),
+        ("N","n"),("S","s"),("E","e"),("W","w"),
+        ("NW","nw"),("NE","ne"),("SW","sw"),("SE","se"),("CENTER","center"),
+        ("WORD","word"),("CHAR","char"),("NONE","none"),
+        ("FLAT","flat"),("RAISED","raised"),("SUNKEN","sunken"),
+        ("GROOVE","groove"),("RIDGE","ridge"),
+        ("NORMAL","normal"),("DISABLED","disabled"),("ACTIVE","active"),
+        ("HORIZONTAL","horizontal"),("VERTICAL","vertical"),
+        ("NSEW","nsew"),("NS","ns"),("EW","ew"),
+        ("FIRST","first"),("LAST","last"),
+        ("TRUE",True),("FALSE",False),
+    ]:
+        setattr(m, _const, _val)
+    # sub-attributes that might be accessed as tkinter.ttk etc.
+    m.ttk         = _tk_stub
+    m.filedialog  = _tk_stub
+    m.messagebox  = _tk_stub
+    m.colorchooser= _tk_stub
+    m.font        = _tk_stub
+    m.scrolledtext= _tk_stub
+    return m
+
+for _modname in ["tkinter", "tkinter.ttk", "tkinter.scrolledtext", "tkinter.messagebox"]:
+    sys.modules[_modname] = _make_tk_module(_modname)
 
 _pv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "packetvista.py")
 _spec    = importlib.util.spec_from_file_location("packetvista", _pv_path)
@@ -108,17 +165,12 @@ def capture_logs():
     stop_evt = threading.Event()
 
     def consumer():
-        while True:
-            # Exit cleanly when stop requested AND queue drained
-            if stop_evt.is_set() and pkt_q.empty():
-                print("Consumer exiting...", flush=True)
-                break
-    
+        while not stop_evt.is_set() or not pkt_q.empty():
             try:
                 item = pkt_q.get(timeout=0.05)
             except queue.Empty:
                 continue
-    
+
             now       = time.time()
             src       = item["src"]
             dst       = item["dst"]
@@ -128,11 +180,11 @@ def capture_logs():
             fl        = item.get("fl", "")
             blen      = item.get("len", 0)
             ts_str    = ts_ist()
-    
+
             alert_text = ("SUSPICIOUS: " + SUSPICIOUS_PORTS[dp]) if dp in SUSPICIOUS_PORTS else ""
             sport_str  = str(sp) if sp else ""
             dport_str  = str(dp) if dp else ""
-    
+
             line = (
                 f"{ts_str:<10}  "
                 f"{src:<18}  {dst:<18}  "
@@ -142,10 +194,9 @@ def capture_logs():
                 f"bytes={blen:<5}"
                 + (f"  ⚠  {alert_text}" if alert_text else "")
             )
-    
             with lock:
                 log_lines.append(("pkt", now, line))
-    
+
             engine.process(src, dst, proto, sp, dp, fl)
 
     t = threading.Thread(target=consumer, daemon=True)
