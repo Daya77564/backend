@@ -108,45 +108,45 @@ def capture_logs():
     stop_evt = threading.Event()
 
     def consumer():
-    while True:
-        # Exit cleanly when stop requested AND queue drained
-        if stop_evt.is_set() and pkt_q.empty():
-            print("Consumer exiting...", flush=True)
-            break
-
-        try:
-            item = pkt_q.get(timeout=0.05)
-        except queue.Empty:
-            continue
-
-        now       = time.time()
-        src       = item["src"]
-        dst       = item["dst"]
-        proto     = item["proto"]
-        sp        = item["sp"]
-        dp        = item["dp"]
-        fl        = item.get("fl", "")
-        blen      = item.get("len", 0)
-        ts_str    = ts_ist()
-
-        alert_text = ("SUSPICIOUS: " + SUSPICIOUS_PORTS[dp]) if dp in SUSPICIOUS_PORTS else ""
-        sport_str  = str(sp) if sp else ""
-        dport_str  = str(dp) if dp else ""
-
-        line = (
-            f"{ts_str:<10}  "
-            f"{src:<18}  {dst:<18}  "
-            f"{proto:<5}  "
-            f"{sport_str:>6} -> {dport_str:<6}  "
-            f"flags={fl:<4}  "
-            f"bytes={blen:<5}"
-            + (f"  ⚠  {alert_text}" if alert_text else "")
-        )
-
-        with lock:
-            log_lines.append(("pkt", now, line))
-
-        engine.process(src, dst, proto, sp, dp, fl)
+        while True:
+            # Exit cleanly when stop requested AND queue drained
+            if stop_evt.is_set() and pkt_q.empty():
+                print("Consumer exiting...", flush=True)
+                break
+    
+            try:
+                item = pkt_q.get(timeout=0.05)
+            except queue.Empty:
+                continue
+    
+            now       = time.time()
+            src       = item["src"]
+            dst       = item["dst"]
+            proto     = item["proto"]
+            sp        = item["sp"]
+            dp        = item["dp"]
+            fl        = item.get("fl", "")
+            blen      = item.get("len", 0)
+            ts_str    = ts_ist()
+    
+            alert_text = ("SUSPICIOUS: " + SUSPICIOUS_PORTS[dp]) if dp in SUSPICIOUS_PORTS else ""
+            sport_str  = str(sp) if sp else ""
+            dport_str  = str(dp) if dp else ""
+    
+            line = (
+                f"{ts_str:<10}  "
+                f"{src:<18}  {dst:<18}  "
+                f"{proto:<5}  "
+                f"{sport_str:>6} -> {dport_str:<6}  "
+                f"flags={fl:<4}  "
+                f"bytes={blen:<5}"
+                + (f"  ⚠  {alert_text}" if alert_text else "")
+            )
+    
+            with lock:
+                log_lines.append(("pkt", now, line))
+    
+            engine.process(src, dst, proto, sp, dp, fl)
 
     t = threading.Thread(target=consumer, daemon=True)
     t.start()
