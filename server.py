@@ -81,7 +81,7 @@ def capture_logs_preflight():
 def capture_logs():
 
     # ── Read duration from query param ───────────────────────────────────────
-    raw = request.args.get("duration", "")
+    raw = "30"
     print(f"[PacketVista] raw duration param: '{raw}'", flush=True)
 
     try:
